@@ -1,0 +1,21 @@
+# 환경변수/비밀
+.env
+*.env.local
+
+# 파이썬/캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# 데이터 산출물(필요 시 개별 커밋 허용)
+output/raw/
+output/interim/
+output/processed/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

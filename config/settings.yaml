@@ -1,0 +1,35 @@
+paths:
+  output_dir: "output"
+  raw_dir: "output/raw"
+  interim_dir: "output/interim"
+  processed_dir: "output/processed"
+
+http:
+  connect_timeout_sec: 3
+  read_timeout_sec: 12
+  max_retries: 5
+  backoff_base_sec: 0.8
+
+sources:
+  odcloud:
+    base: "https://api.odcloud.kr/api"
+    path: "/15056087/v1/uddi:3bcca607-8b03-4760-b1df-abc5d4ef2a36"
+    per_page: 500
+
+  kto:
+    base: "https://apis.data.go.kr/B551011/TatsCnctrRateService"
+    path: "/tatsCnctrRatedList"
+    mobile_os: "WIN"
+    mobile_app: "Yeogigangwon"
+
+  kma:
+    # 일부 문서가 HTTP 표기지만, HTTPS가 동작할 경우 HTTPS 사용 권장!
+    base: "http://apis.data.go.kr/1360000/AsosDalyInfoService"
+    path: "/getWthrDataList"
+    data_type: "JSON"
+    data_cd: "ASOS"
+    date_cd: "DAY"
+
+features:
+  # 시간 피처 버킷 정의
+  peak_hours: [10, 11, 12, 13, 14, 15, 16]  # 예시: 10~16시 피크
