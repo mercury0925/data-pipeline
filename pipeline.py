@@ -35,6 +35,20 @@ from ruamel.yaml import YAML
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from tqdm import tqdm
 
+from urllib.parse import unquote
+
+def normalize_service_key(k: str) -> str:
+    """%252F 처럼 이중/다중 인코딩된 키를 원복(완전 디코딩)한다."""
+    if not k:
+        return k
+    prev = None
+    cur = k
+    # '%25'가 사라질 때까지 반복 디코딩
+    while prev != cur:
+        prev = cur
+        cur = unquote(cur)
+    return cur
+
 # ---------------------------
 # 설정 및 경로 유틸
 # ---------------------------
@@ -108,12 +122,10 @@ def collect_odcloud(settings: dict, service_key: str) -> pd.DataFrame:
             "serviceKey": service_key,
         }
         data = http_get_json(url, params, settings)
-        # odcloud는 {currentCount, data: [...]} 형태
         rows = data.get("data", [])
         if not rows:
             break
         all_rows.extend(rows)
-        # 스냅샷 저장
         snap = raw_dir / f"odcloud_page{page}_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
         snap.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         if len(rows) < per_page:
@@ -126,30 +138,48 @@ def collect_odcloud(settings: dict, service_key: str) -> pd.DataFrame:
 
     df = pd.DataFrame(all_rows)
 
-    # 기본 표준화: 컬럼 추정(문서에 따라 컬럼명이 다를 수 있음 → 존재하면 매핑)
-    # 후보 컬럼: 해수욕장명, 주소, 면적(㎡), 위도/경도 등
-    def pick(colnames: List[str]) -> Optional[str]:
-        for c in colnames:
+    # -------- 컬럼 매핑 (이번 응답 키에 맞춰 강화) --------
+    def pick(candidates: List[str]) -> Optional[str]:
+        for c in candidates:
             if c in df.columns:
                 return c
         return None
 
-    name_col = pick(["해수욕장명", "해수욕장명칭", "해수욕장", "beachName", "name"])
-    area_col = pick(["백사장면적(㎡)", "백사장면적", "area", "sandAreaM2"])
-    lat_col  = pick(["위도", "lat", "LAT"])
-    lon_col  = pick(["경도", "lon", "LON"])
+    name_col   = pick(["해수욕장명", "해수욕장명칭", "해수욕장", "beachName", "name"])
+    # 면적/길이/너비 후보에 '백사장면적(m2)' 포함!
+    area_col   = pick(["백사장면적(㎡)", "백사장면적(m2)", "백사장면적", "면적", "area", "sandAreaM2"])
+    length_col = pick(["길이(m)", "길이", "length_m", "length"])
+    width_col  = pick(["너비(m)", "너비", "width_m", "width"])
+    lat_col    = pick(["위도", "lat", "LAT"])
+    lon_col    = pick(["경도", "lon", "LON"])
 
     std = pd.DataFrame()
-    if name_col is not None:
-        std["beach_name_src"] = df[name_col].astype(str)
-    if area_col is not None:
-        std["sand_area_m2"] = pd.to_numeric(df[area_col], errors="coerce")
-    if lat_col is not None:
-        std["lat"] = pd.to_numeric(df[lat_col], errors="coerce")
-    if lon_col is not None:
-        std["lon"] = pd.to_numeric(df[lon_col], errors="coerce")
 
-    # 내부 표준명/ID 생성(간단 정규화)
+    if name_col:
+        std["beach_name_src"] = df[name_col].astype(str)
+
+    # 숫자 변환 보조: 콤마/공백 제거 후 숫자화
+    def to_num(s: pd.Series) -> pd.Series:
+        return pd.to_numeric(s.astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+
+    # 1) 면적 바로 매핑
+    if area_col:
+        std["sand_area_m2"] = to_num(df[area_col])
+
+    # 2) 면적이 비거나 전부 NaN이면 길이×너비로 보간
+    need_fill = ("sand_area_m2" not in std.columns) or std["sand_area_m2"].isna().all()
+    if need_fill and length_col and width_col:
+        L = to_num(df[length_col])
+        W = to_num(df[width_col])
+        std["sand_area_m2"] = L * W
+
+    # 좌표(있으면 매핑)
+    if lat_col:
+        std["lat"] = to_num(df[lat_col])
+    if lon_col:
+        std["lon"] = to_num(df[lon_col])
+
+    # 표준명/ID 생성
     def normalize_name(x: str) -> str:
         x = re.sub(r"\s+", "", x)
         x = x.replace("해수욕장", "")
@@ -161,7 +191,7 @@ def collect_odcloud(settings: dict, service_key: str) -> pd.DataFrame:
 
     # 중복 제거
     if "beach_id" in std:
-        std = std.drop_duplicates(subset=["beach_id"])
+        std = std.drop_duplicates(subset=["beach_id"]).reset_index(drop=True)
 
     # 저장
     interim_path = interim_dir / f"beach_meta_{datetime.now().strftime('%Y%m%d')}.csv"
@@ -169,12 +199,25 @@ def collect_odcloud(settings: dict, service_key: str) -> pd.DataFrame:
     print(f"[ODCLOUD] 표준화 저장: {interim_path}")
     return std
 
+
 # ---------------------------
 # 한국관광공사 (집중률 예측)
 # ---------------------------
 def collect_kto(settings: dict, service_key: str, area_cd: str, num_rows: int,
                 sigungu_cd: Optional[str], tAtsNm: Optional[str]) -> pd.DataFrame:
-    base = settings["sources"]["kto"]["base"]
+    """
+    한국관광공사 '관광지 집중률 방문자 추이 예측 정보' 수집/표준화.
+
+    - signguCd(시군구코드) 필수: 인자로 없으면 settings.sources.kto.signgu_codes[area_cd] 순회
+    - tAtsNm(관광지명) 선택
+    - 응답이 JSON / JSON-string / XML(에러 포함) 모두 안전 파싱
+    - SSL시 http↔https 폴백, 서비스키 다중 인코딩 정규화
+    - 스냅샷 저장 및 표준화 출력
+    """
+    from datetime import datetime
+    import glob, xmltodict
+
+    base = settings["sources"]["kto"]["base"]     # 매뉴얼 기준 http 권장
     path = settings["sources"]["kto"]["path"]
     mobile_os = settings["sources"]["kto"]["mobile_os"]
     mobile_app = settings["sources"]["kto"]["mobile_app"]
@@ -184,86 +227,170 @@ def collect_kto(settings: dict, service_key: str, area_cd: str, num_rows: int,
     raw_dir.mkdir(parents=True, exist_ok=True)
     interim_dir.mkdir(parents=True, exist_ok=True)
 
-    page_no = 1
-    all_items: List[dict] = []
-    while True:
-        url = base + path
-        params = {
-            "serviceKey": service_key,
-            "pageNo": page_no,
-            "numOfRows": num_rows,
-            "MobileOS": mobile_os,
-            "MobileApp": mobile_app,
-            "areaCd": area_cd,
-            "_type": "json",
-        }
-        if sigungu_cd:
-            params["sigunguCd"] = sigungu_cd
-        if tAtsNm:
-            params["tAtsNm"] = tAtsNm
+    # ---- serviceKey 정규화 (이중 인코딩 방지). 인코딩 키를 그대로 쓰려면 USE_ENCODED_KTO_KEY=true ----
+    use_encoded = os.getenv("USE_ENCODED_KTO_KEY", "").lower() == "true"
+    skey = service_key if use_encoded else normalize_service_key(service_key)
 
-        data = http_get_json(url, params, settings)
+    # ---- signguCd 결정 (필수) ----
+    if sigungu_cd:
+        signgu_list = [str(sigungu_cd)]
+    else:
+        signgu_map = settings["sources"]["kto"].get("signgu_codes", {})
+        signgu_list = [str(x) for x in signgu_map.get(str(area_cd), [])]
+        if not signgu_list:
+            raise ValueError(
+                "signguCd(시군구 코드)가 필요합니다. "
+                "--sigungu <코드>를 주거나, config/settings.yaml의 "
+                "sources.kto.signgu_codes[area_cd]에 목록을 채워주세요."
+            )
 
-        # KTO 표준 응답 가정: {response:{body:{items:{item:[...]}}}}
-        items = (
-            data.get("response", {})
-                .get("body", {})
-                .get("items", {})
-                .get("item", [])
-        )
-        if not items:
-            break
-        all_items.extend(items)
-        snap = raw_dir / f"kto_page{page_no}_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
-        snap.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        if len(items) < num_rows:
-            break
-        page_no += 1
+    # ---- 요청/파싱 보조 ----
+    def try_request(url: str, params: dict) -> dict:
+        """http_get_json 사용 + SSL/핸드셰이크 시 스킴 폴백."""
+        try:
+            return http_get_json(url, params, settings)
+        except HttpError as e:
+            msg = str(e).lower()
+            if "ssl" in msg or "handshake" in msg:
+                alt = url.replace("https://", "http://") if url.startswith("https://") else url.replace("http://", "https://")
+                return http_get_json(alt, params, settings)
+            raise
 
-    if not all_items:
+    def to_dict(data: Any) -> dict:
+        """응답을 dict로 정규화: dict → 그대로, str → JSON 시도 → XML 시도."""
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, str):
+            # JSON 문자열 시도
+            try:
+                return json.loads(data)
+            except Exception:
+                pass
+            # XML 문자열 시도
+            try:
+                return xmltodict.parse(data)
+            except Exception:
+                # 파싱 실패 시 원문을 담아 반환(에러 메시지로 노출)
+                return {"raw": data}
+        # 그 외 타입 방어
+        return {"raw": str(data)}
+
+    def raise_if_openapi_error(doc: dict) -> None:
+        """OpenAPI_ServiceResponse(XML 에러 포맷)이면 명확한 예외 발생."""
+        svc = doc.get("OpenAPI_ServiceResponse")
+        if not svc:
+            return
+        hdr = svc.get("cmmMsgHeader", {})
+        err = hdr.get("returnAuthMsg") or hdr.get("errMsg") or "UNKNOWN_ERROR"
+        code = hdr.get("returnReasonCode")
+        raise HttpError(f"[KTO] OpenAPI 오류: {err} (code={code})")
+
+    def extract_items(doc: dict) -> List[dict]:
+        """표준 JSON 구조에서 items.item을 안전하게 추출."""
+        resp = doc.get("response") or {}
+        body = resp.get("body") or {}
+        items = body.get("items") or {}
+        it = items.get("item")
+        if it is None:
+            return []
+        if isinstance(it, list):
+            return it
+        return [it]  # 단일 객체일 때
+
+    def fetch_for_signgu(signgu: str, extra_params: dict) -> List[dict]:
+        page_no = 1
+        items_all: List[dict] = []
+        while True:
+            url = base + path
+            params = {
+                "serviceKey": skey,
+                "pageNo": page_no,
+                "numOfRows": num_rows,
+                "MobileOS": mobile_os,
+                "MobileApp": mobile_app,
+                "areaCd": area_cd,
+                "signguCd": signgu,   # ← 필수 파라미터
+                "_type": "json",
+            }
+            if tAtsNm:
+                params["tAtsNm"] = tAtsNm
+            params.update(extra_params)
+
+            raw = try_request(url, params)
+            doc = to_dict(raw)
+
+            # 스냅샷 저장(원문 그대로)
+            snap = raw_dir / f"kto_{signgu}_page{page_no}_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+            try:
+                snap.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                # dict 직렬화 실패 시 문자열로 저장
+                snap.write_text(str(doc), encoding="utf-8")
+
+            # XML 에러 포맷이면 명확히 실패시킴
+            raise_if_openapi_error(doc)
+
+            items = extract_items(doc)
+            if not items:
+                break
+            items_all.extend(items)
+            if len(items) < num_rows:
+                break
+            page_no += 1
+        return items_all
+
+    # ---- 1) 기본 수집 ----
+    items: List[dict] = []
+    for sgg in signgu_list:
+        items += fetch_for_signgu(sgg, extra_params={})
+
+    # ---- 2) 비어 있으면 baseYmd=오늘로 재시도(운영상 날짜 요구 케이스 대비) ----
+    if not items:
+        today = datetime.now().strftime("%Y%m%d")
+        for sgg in signgu_list:
+            items += fetch_for_signgu(sgg, extra_params={"baseYmd": today})
+
+    if not items:
         print("[KTO] 데이터 없음!")
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_items)
+    df = pd.DataFrame(items)
 
-    # 표준 컬럼 추정/정규화: 이름/시각/예측치
-    # 공공데이터 컬럼명이 고정이 아닐 수 있어 후보군으로 탐색
-    def pick(colnames: List[str]) -> Optional[str]:
-        for c in colnames:
+    # -------- 표준화 --------
+    def pick(cols: List[str]) -> Optional[str]:
+        for c in cols:
             if c in df.columns:
                 return c
         return None
 
     name_col = pick(["tAtsNm", "관광지명", "name", "title"])
-    ts_col   = pick(["baseYmd", "baseDe", "ymd", "date", "obsrDe"])  # 날짜(YYYYMMDD or YYYY-MM-DD)
+    ts_col   = pick(["baseYmd", "baseDe", "ymd", "date", "obsrDe"])
     pred_col = pick(["cnctrRate", "cnctrRatePred", "visitorRate", "predicted", "value"])
 
     std = pd.DataFrame()
     if name_col:
         std["place_name_src"] = df[name_col].astype(str)
     if ts_col:
-        # YYYYMMDD → YYYY-MM-DD 변환 시도
-        ts_val = pd.to_datetime(df[ts_col].astype(str), errors="coerce")
-        std["date"] = ts_val.dt.date
+        std["date"] = pd.to_datetime(df[ts_col].astype(str), errors="coerce").dt.date
     if pred_col:
         std["visitor_rate_pred"] = pd.to_numeric(df[pred_col], errors="coerce")
 
-    # 해수욕장만 필터링하려면 이름 정규화 후 '해수욕장' 키워드 또는 매핑 사용
     def normalize_beach_name(x: str) -> str:
         x0 = re.sub(r"\s+", "", x)
-        x0 = x0.replace("해수욕장", "")
-        return x0
+        return x0.replace("해수욕장", "")
 
     if "place_name_src" in std:
         std["beach_name_std"] = std["place_name_src"].map(normalize_beach_name)
         std["beach_id"] = std["beach_name_std"].str.lower()
+    if "date" in std.columns:
+        std = std.dropna(subset=["date"]).copy()
 
-    std = std.dropna(subset=["date"]).copy()
-
-    interim_path = interim_dir / f"kto_{area_cd}_{datetime.now().strftime('%Y%m%d')}.csv"
-    std.to_csv(interim_path, index=False, encoding="utf-8-sig")
-    print(f"[KTO] 표준화 저장: {interim_path}")
+    out_path = interim_dir / f"kto_{area_cd}_{datetime.now().strftime('%Y%m%d')}.csv"
+    std.to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"[KTO] 표준화 저장: {out_path}")
     return std
+
+
 
 # ---------------------------
 # 기상청 ASOS 일자료
@@ -278,103 +405,173 @@ def daterange_days(d0: date, d1: date) -> List[date]:
 
 def collect_kma_asos_daily(settings: dict, service_key: str,
                            stn_ids: List[str], start: date, end: date) -> pd.DataFrame:
-    base = settings["sources"]["kma"]["base"]
-    path = settings["sources"]["kma"]["path"]
-    data_type = settings["sources"]["kma"]["data_type"]
-    data_cd = settings["sources"]["kma"]["data_cd"]
-    date_cd = settings["sources"]["kma"]["date_cd"]
+    """
+    기상청 ASOS 일자료 조회 서비스 수집/표준화.
+    - 입력: 다수 지점(stn_ids), 시작/종료일(YYYY-MM-DD)
+    - 출력: 지점별 CSV 저장 + 모든 지점 concat한 DataFrame 반환
+    - 기능: 서비스키 다중 인코딩 정규화, http↔https 폴백, XML/JSON 안전파싱
+    - 저장 파일명: output/interim/kma/asos_daily_{stn}_{start}_{end}.csv
+    - 표준 컬럼: ['asos_stn_id','date','tavg','tmin','tmax','rain_sum','wind_avg','humid_avg']
+    """
+    from datetime import datetime
+    import xmltodict
 
+    base = settings["sources"]["kma"]["base"]          # 예: http://apis.data.go.kr/1360000/AsosDalyInfoService
+    path = settings["sources"]["kma"]["path"]          # 예: /getWthrDataList
     raw_dir = Path(settings["paths"]["raw_dir"]) / "kma"
     interim_dir = Path(settings["paths"]["interim_dir"]) / "kma"
     raw_dir.mkdir(parents=True, exist_ok=True)
     interim_dir.mkdir(parents=True, exist_ok=True)
 
-    # 월별 청크로 끊어서 호출(일자료는 한 번에 많이 요청해도 되지만 보수적으로 운용)
-    def month_chunks(start: date, end: date):
-        cur = date(start.year, start.month, 1)
-        while cur <= end:
-            if cur.month == 12:
-                nxt = date(cur.year + 1, 1, 1)
-            else:
-                nxt = date(cur.year, cur.month + 1, 1)
-            chunk_end = min(end, nxt - timedelta(days=1))
-            yield cur, chunk_end
-            cur = nxt
+    # ---- serviceKey 정규화 (인코딩키 그대로 쓰려면 USE_ENCODED_KMA_KEY=true) ----
+    use_encoded = os.getenv("USE_ENCODED_KMA_KEY", "").lower() == "true"
+    skey = service_key if use_encoded else normalize_service_key(service_key)
 
-    all_rows: List[pd.DataFrame] = []
-    for stn in stn_ids:
-        for mstart, mend in month_chunks(start, end):
+    def try_request(url: str, params: dict) -> Any:
+        """requests 기반 http_get_json 사용 + SSL/핸드셰이크 시 스킴 폴백."""
+        try:
+            return http_get_json(url, params, settings)
+        except HttpError as e:
+            msg = str(e).lower()
+            if "ssl" in msg or "handshake" in msg:
+                alt = url.replace("https://", "http://") if url.startswith("https://") else url.replace("http://", "https://")
+                return http_get_json(alt, params, settings)
+            raise
+
+    def to_dict(data: Any) -> dict:
+        """응답을 dict로 정규화: dict → 그대로, str → JSON 시도 → XML 시도."""
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, str):
+            try:
+                return json.loads(data)
+            except Exception:
+                pass
+            try:
+                return xmltodict.parse(data)
+            except Exception:
+                return {"raw": data}
+        return {"raw": str(data)}
+
+    def raise_if_openapi_error(doc: dict) -> None:
+        """OpenAPI_ServiceResponse(XML 에러 포맷)이면 명확한 예외 발생."""
+        svc = doc.get("OpenAPI_ServiceResponse")
+        if not svc:
+            return
+        hdr = svc.get("cmmMsgHeader", {})
+        err = hdr.get("returnAuthMsg") or hdr.get("errMsg") or "UNKNOWN_ERROR"
+        code = hdr.get("returnReasonCode")
+        raise HttpError(f"[KMA] OpenAPI 오류: {err} (code={code})")
+
+    def extract_items(doc: dict) -> List[dict]:
+        """표준 JSON 구조에서 items.item을 안전 추출."""
+        resp = doc.get("response") or {}
+        body = resp.get("body") or {}
+        items = body.get("items") or {}
+        it = items.get("item")
+        if it is None:
+            return []
+        if isinstance(it, list):
+            return it
+        return [it]  # 단일 객체
+
+    def page_fetch(stn: str) -> pd.DataFrame:
+        page_no = 1
+        rows_all: List[dict] = []
+        num_rows = settings.get("kma", {}).get("num_rows", 500)  # 없으면 기본 500
+        start_str = start.strftime("%Y%m%d")
+        end_str = end.strftime("%Y%m%d")
+
+        while True:
             url = base + path
             params = {
-                "serviceKey": service_key,
-                "pageNo": 1,
-                "numOfRows": 500,  # 일자료 월 31일 가정
-                "dataType": data_type,
-                "dataCd": data_cd,
-                "dateCd": date_cd,
-                "startDt": mstart.strftime("%Y%m%d"),
-                "endDt": mend.strftime("%Y%m%d"),
-                "stnIds": stn,
+                "serviceKey": skey,
+                "pageNo": page_no,
+                "numOfRows": num_rows,
+                "dataType": "JSON",
+                "dataCd": "ASOS",
+                "dateCd": "DAY",
+                "startDt": start_str,
+                "endDt": end_str,
+                "stnIds": str(stn),
             }
-            data = http_get_json(url, params, settings)
-            items = (
-                data.get("response", {})
-                    .get("body", {})
-                    .get("items", {})
-                    .get("item", [])
-            )
-            snap = raw_dir / f"asos_{stn}_{mstart.strftime('%Y%m')}.json"
-            snap.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            raw = try_request(url, params)
+            doc = to_dict(raw)
 
+            # 스냅샷 저장
+            snap = raw_dir / f"asos_daily_{stn}_page{page_no}_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+            try:
+                snap.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                snap.write_text(str(doc), encoding="utf-8")
+
+            raise_if_openapi_error(doc)
+            items = extract_items(doc)
             if not items:
-                continue
+                break
+            rows_all.extend(items)
+            if len(items) < num_rows:
+                break
+            page_no += 1
 
-            df = pd.DataFrame(items)
-            # 컬럼 후보 매핑
-            # 날짜: tm(YYYY-MM-DD) 또는 ymd
-            # 평균기온: avgTa, 강수량합계: sumRn, 평균풍속: avgWs, 평균상대습도: avgRhm 등
-            def pick(colnames: List[str]) -> Optional[str]:
-                for c in colnames:
-                    if c in df.columns:
-                        return c
-                return None
+        if not rows_all:
+            return pd.DataFrame()
 
-            tm_col   = pick(["tm", "ymd", "date"])
-            tavg_col = pick(["avgTa", "taAvg", "tavg"])
-            tmin_col = pick(["minTa", "tmin"])
-            tmax_col = pick(["maxTa", "tmax"])
-            rain_col = pick(["sumRn", "rnDay", "rain_sum"])
-            wind_col = pick(["avgWs", "windAvg"])
-            humi_col = pick(["avgRhm", "rhmAvg", "humid_avg"])
+        # ---- 표준화 매핑 ----
+        df = pd.DataFrame(rows_all)
 
-            std = pd.DataFrame()
-            std["asos_stn_id"] = stn
-            if tm_col:
-                std["date"] = pd.to_datetime(df[tm_col], errors="coerce").dt.date
-            if tavg_col:
-                std["tavg"] = pd.to_numeric(df[tavg_col], errors="coerce")
-            if tmin_col:
-                std["tmin"] = pd.to_numeric(df[tmin_col], errors="coerce")
-            if tmax_col:
-                std["tmax"] = pd.to_numeric(df[tmax_col], errors="coerce")
-            if rain_col:
-                std["rain_sum"] = pd.to_numeric(df[rain_col], errors="coerce")
-            if wind_col:
-                std["wind_avg"] = pd.to_numeric(df[wind_col], errors="coerce")
-            if humi_col:
-                std["humid_avg"] = pd.to_numeric(df[humi_col], errors="coerce")
+        def pick(cols: List[str]) -> Optional[str]:
+            for c in cols:
+                if c in df.columns:
+                    return c
+            return None
 
-            all_rows.append(std)
+        # KMA 컬럼 표준명 후보
+        tm_col     = pick(["tm", "date"])              # 날짜
+        avgTa_col  = pick(["avgTa", "avgta", "tavg"])  # 평균기온
+        minTa_col  = pick(["minTa", "tmn", "tmin"])
+        maxTa_col  = pick(["maxTa", "tmx", "tmax"])
+        sumRn_col  = pick(["sumRn", "rn_day", "rain_sum"])
+        avgWs_col  = pick(["avgWs", "ws", "wind_avg"])
+        avgRhm_col = pick(["avgRhm", "rhm", "humid_avg"])
 
-    if not all_rows:
-        print("[KMA] 데이터 없음!")
+        out = pd.DataFrame()
+        if tm_col:
+            out["date"] = pd.to_datetime(df[tm_col].astype(str), errors="coerce").dt.date
+        if avgTa_col:
+            out["tavg"] = pd.to_numeric(df[avgTa_col], errors="coerce")
+        if minTa_col:
+            out["tmin"] = pd.to_numeric(df[minTa_col], errors="coerce")
+        if maxTa_col:
+            out["tmax"] = pd.to_numeric(df[maxTa_col], errors="coerce")
+        if sumRn_col:
+            out["rain_sum"] = pd.to_numeric(df[sumRn_col], errors="coerce")
+        if avgWs_col:
+            out["wind_avg"] = pd.to_numeric(df[avgWs_col], errors="coerce")
+        if avgRhm_col:
+            out["humid_avg"] = pd.to_numeric(df[avgRhm_col], errors="coerce")
+
+        # 지점 코드 추가
+        out["asos_stn_id"] = str(stn)
+
+        # 저장
+        out_path = interim_dir / f"asos_daily_{stn}_{start_str}_{end_str}.csv"
+        out.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"[KMA] 표준화 저장: {out_path}")
+        return out
+
+    # ---- 지점별 수집 + 결합 ----
+    all_df: List[pd.DataFrame] = []
+    for stn in stn_ids:
+        part = page_fetch(str(stn))
+        if not part.empty:
+            all_df.append(part)
+
+    if not all_df:
+        print("[KMA] 수집 결과가 비었습니다.")
         return pd.DataFrame()
 
-    out = pd.concat(all_rows, ignore_index=True)
-    interim_path = interim_dir / f"asos_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.csv"
-    out.to_csv(interim_path, index=False, encoding="utf-8-sig")
-    print(f"[KMA] 표준화 저장: {interim_path}")
-    return out
+    return pd.concat(all_df, ignore_index=True)
 
 # ---------------------------
 # 시간 파생 피처

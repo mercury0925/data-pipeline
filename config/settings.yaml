@@ -17,13 +17,32 @@ sources:
     per_page: 500
 
   kto:
-    base: "https://apis.data.go.kr/B551011/TatsCnctrRateService"
+    base: "http://apis.data.go.kr/B551011/TatsCnctrRateService"
     path: "/tatsCnctrRatedList"
     mobile_os: "WIN"
     mobile_app: "Yeogigangwon"
+    signgu_codes:
+      "51":
+        - "51110"  # 춘천시
+        - "51130"  # 원주시
+        - "51150"  # 강릉시
+        - "51170"  # 동해시
+        - "51190"  # 태백시
+        - "51210"  # 속초시
+        - "51230"  # 삼척시
+        - "51720"  # 홍천군
+        - "51730"  # 횡성군
+        - "51750"  # 영월군
+        - "51760"  # 평창군
+        - "51770"  # 정선군
+        - "51780"  # 철원군
+        - "51790"  # 화천군
+        - "51800"  # 양구군
+        - "51810"  # 인제군
+        - "51820"  # 고성군
+        - "51830"  # 양양군
 
   kma:
-    # 일부 문서가 HTTP 표기지만, HTTPS가 동작할 경우 HTTPS 사용 권장!
     base: "http://apis.data.go.kr/1360000/AsosDalyInfoService"
     path: "/getWthrDataList"
     data_type: "JSON"
