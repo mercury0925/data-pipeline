@@ -615,57 +615,121 @@ def attach_asos_to_beach(beach_df: pd.DataFrame, mapping: Dict[str, str]) -> pd.
 # 조인: beach_id + date 기준
 # ---------------------------
 def build_training_table(settings: dict,
-                         od_df: pd.DataFrame,
-                         kto_df: pd.DataFrame,
-                         asos_df: pd.DataFrame,
+                         od_map: pd.DataFrame,      # ODCLOUD 메타(해변별 고정 정보)
+                         kto_df: pd.DataFrame,      # KTO 집중률(관광지/날짜)
+                         asos_df: pd.DataFrame,     # ASOS 일자료(지점/날짜)
                          area_cd: str) -> pd.DataFrame:
-    # 해변 메타에 ASOS 매핑 부여
-    od_map = attach_asos_to_beach(od_df, DEFAULT_BEACH_TO_ASOS)
+    """
+    통합 학습 테이블 생성:
+      - 필수: beach_id, sand_area_m2, date
+      - 선택: lat, lon, asos_stn_id (없으면 NaN으로 채워 진행)
+      - ASOS 매핑:
+          * od_map에 asos_stn_id가 있으면 (date, asos_stn_id)로 조인
+          * 없으면 ASOS를 날짜별 평균치로 뽑아 전체 해변에 동일 적용
+      - KTO가 없어도(빈 DF) 피처셋만 생성
+    저장: output/processed/train_dataset_area{area_cd}_YYYYMMDD.csv
+    """
+    from datetime import datetime
 
-    # KTO는 이미 beach_id/date/visitor_rate_pred 보유
-    left = kto_df.dropna(subset=["beach_id", "date"]).copy()
+    # ---- 0) ODCLOUD 메타 선택 컬럼 안전 선택 ----
+    base_cols = ["beach_id", "beach_name_std", "sand_area_m2"]
+    opt_cols  = ["lat", "lon", "asos_stn_id"]
 
-    # odcloud와 조인(면적 등 메타)
-    left = left.merge(
-        od_map[["beach_id", "beach_name_std", "sand_area_m2", "lat", "lon", "asos_stn_id"]],
-        on="beach_id", how="left"
-    )
+    for c in base_cols:
+        if c not in od_map.columns:
+            raise ValueError(f"[JOIN] ODCLOUD 메타에 '{c}' 컬럼이 없습니다. 수집/표준화를 확인해주세요.")
 
-    # ASOS는 stn_id+date 기준으로 매칭 → 먼저 beach별로 stn_id를 가져오고 date로 조인
-    if "asos_stn_id" in left.columns and not asos_df.empty:
-        asos_small = asos_df.dropna(subset=["asos_stn_id", "date"]).copy()
-        left = left.merge(
-            asos_small,
-            on=["asos_stn_id", "date"],
-            how="left",
-            suffixes=("", "_asos")
+    present_cols = base_cols + [c for c in opt_cols if c in od_map.columns]
+    od_sel = od_map[present_cols].copy()
+    # 누락 선택 컬럼은 NaN으로 추가
+    for c in opt_cols:
+        if c not in od_sel.columns:
+            od_sel[c] = pd.NA
+
+    # ---- 1) 날짜·해변 베이스 인덱스 만들기 ----
+    # 1) KTO가 있으면 그 날짜·해변을 우선 사용
+    have_kto = not kto_df.empty and {"beach_id", "date"}.issubset(kto_df.columns)
+    if have_kto:
+        kto_df = kto_df.copy()
+        kto_df["date"] = pd.to_datetime(kto_df["date"], errors="coerce").dt.date
+        base_idx = kto_df[["beach_id", "date"]].dropna().drop_duplicates()
+    else:
+        # 2) KTO가 없으면 ASOS 날짜범위 × 모든 해변으로 기본 인덱스 생성
+        if asos_df.empty or "date" not in asos_df.columns:
+            raise ValueError("[JOIN] KTO도 없고 ASOS도 없습니다. 최소 한 소스의 날짜가 필요합니다.")
+        dt = pd.to_datetime(asos_df["date"], errors="coerce").dt.date
+        days = pd.Series(sorted(dt.dropna().unique()), name="date")
+        beaches = od_sel["beach_id"].dropna().unique()
+        base_idx = pd.MultiIndex.from_product([beaches, days], names=["beach_id", "date"]).to_frame(index=False)
+
+    # ---- 2) ASOS 준비: 매핑 유무에 따라 전략 분기 ----
+    asos_df = asos_df.copy()
+    asos_df["date"] = pd.to_datetime(asos_df["date"], errors="coerce").dt.date
+
+    # 수치 컬럼만 평균 계산 대상으로
+    asos_num = asos_df.select_dtypes(include="number").columns.tolist()
+    # date, asos_stn_id는 키 컬럼으로 유지
+    if "asos_stn_id" in asos_df.columns:
+        key_cols = ["date", "asos_stn_id"]
+    else:
+        key_cols = ["date"]
+
+    # 그룹 집계 (지점별 평균 혹은 날짜 평균)
+    if "asos_stn_id" in asos_df.columns:
+        wthr = asos_df.groupby(key_cols, as_index=False)[asos_num].mean(numeric_only=True)
+    else:
+        wthr = asos_df.groupby("date", as_index=False)[asos_num].mean(numeric_only=True)
+
+    # ---- 3) 베이스 인덱스 ← 해변 메타 조인 ----
+    df = base_idx.merge(od_sel, on="beach_id", how="left")
+
+    # ---- 4) 베이스 인덱스 ← KTO 조인(있으면) ----
+    if have_kto and "visitor_rate_pred" in kto_df.columns:
+        df = df.merge(
+            kto_df[["beach_id", "date", "visitor_rate_pred"]],
+            on=["beach_id", "date"], how="left"
         )
+    else:
+        df["visitor_rate_pred"] = pd.NA  # KTO 없으면 타겟 결측으로 둔다
 
-    # 시간 파생 피처
-    peak_hours = settings["features"].get("peak_hours", [])
-    left = add_time_features(left, date_col="date", hour_col=None, peak_hours=peak_hours)
+    # ---- 5) 베이스 인덱스 ← ASOS 조인 ----
+    if "asos_stn_id" in df.columns and df["asos_stn_id"].notna().any() and "asos_stn_id" in wthr.columns:
+        # 해변별 관측소 매핑이 있을 때: (date, asos_stn_id)로 정밀 조인
+        df = df.merge(wthr, on=["date", "asos_stn_id"], how="left", suffixes=("", "_w"))
+    else:
+        # 매핑이 없을 때: 날짜 평균 날씨를 전 해변 공통 적용
+        df = df.merge(wthr, on=["date"], how="left", suffixes=("", "_w"))
 
-    # 학습셋 최소 필수 컬럼 정리
-    cols = [
-        "beach_id", "beach_name_std", "date",
-        "sand_area_m2", "lat", "lon",
-        "tavg", "tmin", "tmax", "rain_sum", "wind_avg", "humid_avg",
-        "year", "month", "day", "dow", "is_weekend", "season",
-        "visitor_rate_pred"
-    ]
-    for c in cols:
-        if c not in left.columns:
-            left[c] = pd.NA
+    # ---- 6) 시간 파생 피처 ----
+    dt = pd.to_datetime(df["date"], errors="coerce")
+    df["year"]  = dt.dt.year
+    df["month"] = dt.dt.month
+    df["dow"]   = dt.dt.weekday  # 월=0, 일=6
+    df["is_weekend"] = df["dow"].isin([5, 6]).astype("Int64")
 
-    left = left[cols].drop_duplicates()
+    # 시즌(임시 규칙): 6~8=성수기, 9~10=가을, 11~2=비수기, 3~5=봄
+    def season_of(m):
+        if pd.isna(m):
+            return pd.NA
+        m = int(m)
+        if 6 <= m <= 8:
+            return "peak"
+        if 9 <= m <= 10:
+            return "autumn"
+        if m in (11, 12, 1, 2):
+            return "off"
+        return "spring"
+    df["season"] = df["month"].map(season_of)
 
-    # 저장
-    processed_dir = Path(settings["paths"]["processed_dir"])
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    out = processed_dir / f"train_dataset_area{area_cd}_{datetime.now().strftime('%Y%m%d')}.csv"
-    left.to_csv(out, index=False, encoding="utf-8-sig")
-    print(f"[JOIN] 최종 학습셋 저장: {out}")
-    return left
+    # ---- 7) 저장 ----
+    out_dir = Path(settings["paths"]["processed_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"train_dataset_area{area_cd}_{datetime.now().strftime('%Y%m%d')}.csv"
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"[JOIN] 최종 저장: {out_path}  (rows={len(df)})")
+
+    return df
+
 
 # ---------------------------
 # CLI
