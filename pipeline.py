@@ -802,13 +802,17 @@ def main():
 
     elif args.cmd == "join":
         # 중간 산출물 읽기
-        # ODCLOUD
+        # ODCLOUD (해수욕장 표준 메타)
         od_dir = Path(settings["paths"]["interim_dir"]) / "odcloud"
         od_files = sorted(od_dir.glob("beach_meta_*.csv"))
         if not od_files:
             print("[JOIN] odcloud 표준화 파일이 없습니다! 먼저 python pipeline.py odcloud 실행!", file=sys.stderr)
             sys.exit(1)
         od_df = pd.read_csv(od_files[-1], encoding="utf-8")
+
+        # ⬇️ [추가] od_df (해수욕장 목록)에서 강원특별자치도 데이터만 남기도록 필터링 ⬇️
+        print("[JOIN] 해수욕장 목록을 '강원특별자치도'로 필터링합니다.")
+        od_df = od_df[od_df["sido_nm"] == "강원특별자치도"].copy()
 
         # KTO
         kto_dir = Path(settings["paths"]["interim_dir"]) / "kto"

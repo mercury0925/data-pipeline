@@ -6,7 +6,7 @@ paths:
 
 http:
   connect_timeout_sec: 3
-  read_timeout_sec: 12
+  read_timeout_sec: 30
   max_retries: 5
   backoff_base_sec: 0.8
 
